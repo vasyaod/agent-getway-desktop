@@ -1,0 +1,8 @@
+{
+  "id": "agent-getway-phone",
+  "name": "Getway Chat",
+  "color": "#29B6D1",
+  "icon": "getway-chat",
+  "source": "vasyaod/icons@10591bcf2268bc5aca1af4f4f50d966edb7ce378",
+  "sha256": "bc7646abbafec149abf1a40ef445895d5a08d08ba389f0e61da8e7f61855f80d"
+}
