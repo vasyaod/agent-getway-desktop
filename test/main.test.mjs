@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { fake, reset } from './fake-electron/index.mjs';
+import { fake, nativeImage, reset } from './fake-electron/index.mjs';
 
 const START = pathToFileURL(path.resolve('src/start/index.html')).href;
 const CHAT = 'https://agent-getway.f-proj.com/#/chat';
@@ -161,6 +161,7 @@ test('signed in at launch: straight to the chat; a reply notifies, badges and op
   assert.equal(note.shown, true);
   assert.deepEqual(fake.badge, [1]);
   assert.match(fake.trays[0].image.path, /tray-unread\.png$/);
+  assert.equal(fake.trays[0].image.template, false, 'Windows/Linux: the white PNG, not a template');
   assert.equal(fake.trays[0].tooltip, 'Getway Chat: 1 unread reply');
 
   fake.focused = true;
@@ -169,6 +170,29 @@ test('signed in at launch: straight to the chat; a reply notifies, badges and op
   assert.deepEqual(fake.badge, [1, 0]);
   assert.match(fake.trays[0].image.path, /tray\.png$/);
   assert.ok(n.calls.every((c) => c.headers.Authorization === 'Bearer fpu_old'));
+  quit();
+});
+
+test('macOS: the tray icon is a template image, read and unread, so the menu bar tints it', async (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+  t.after(() => Object.defineProperty(process, 'platform', platform));
+  mock.timers.enable({ apis: ['setInterval'] });
+  const n = net();
+  n.chats = [{ id: A, title: 'Deploy', message_count: 2, updated_at: 't1' }];
+  n.messages[A] = [{ id: 'm2', role: 'assistant', text: 'old' }];
+  await launch({ cookies: [liveCookie()], focused: false });
+  assert.match(fake.trays[0].image.path, /trayTemplate\.png$/);
+  assert.equal(fake.trays[0].image.template, true);
+  await until(() => n.calls.length >= 1, 'the priming poll');
+  await new Promise((r) => setTimeout(r, 20));
+
+  n.chats = [{ id: A, title: 'Deploy', message_count: 4, updated_at: 't2' }];
+  n.messages[A].push({ role: 'user', text: 'q' }, { id: 'm4', role: 'assistant', text: 'new reply' });
+  mock.timers.tick(30_000);
+  await until(() => fake.notifications.length === 1, 'the notification');
+  assert.match(fake.trays[0].image.path, /tray-unreadTemplate\.png$/);
+  assert.equal(fake.trays[0].image.template, true);
   quit();
 });
 
@@ -281,6 +305,8 @@ test('smoke: a signed-out gateway visit is redirected to /login, cancelled, and 
   assert.equal(report.step, 'done');
   assert.equal(report.guard, 'expired');
   assert.deepEqual(report.probe.answer, '302 https://auth.f-proj.com/login');
+  assert.deepEqual(report.tray_icons.map((i) => [i.empty, i.size.width, i.scales, i.template]),
+    [[false, 16, [1, 1.5, 2], false], [false, 16, [1, 1.5, 2], false]], 'the white tray PNGs, 16 px, @1.5x, @2x');
   const steps = report.trace.map((t) => t.replace(/^\d+ms /, ''));
   assert.deepEqual(steps, [
     'did-start-navigation https://agent-getway.f-proj.com/',
@@ -322,6 +348,19 @@ test('smoke: the gateway page loading instead of redirecting fails the smoke and
   assert.equal(report.lastGuard, null);
   assert.equal(report.url, 'https://agent-getway.f-proj.com/');
   assert.ok(report.trace.some((t) => t.endsWith('did-redirect-navigation https://agent-getway.f-proj.com/')));
+});
+
+test('smoke: a tray icon missing from the package fails the smoke', async (t) => {
+  const load = nativeImage.createFromPath;
+  t.after(() => { nativeImage.createFromPath = load; });
+  nativeImage.createFromPath = (p) => load(p.replace('tray-unread', 'tray-missing'));
+  net();
+  const { code, report } = await smokeRun({ setup: () => {
+    fake.redirects['https://agent-getway.f-proj.com/'] = 'https://auth.f-proj.com/login?rd=https%3A%2F%2Fagent-getway.f-proj.com%2F';
+  } });
+  assert.equal(code, 1);
+  assert.equal(report.guard, 'expired', 'everything else passed');
+  assert.deepEqual(report.tray_icons.map((i) => i.empty), [false, true]);
 });
 
 const G = 'https://agent-getway.f-proj.com/';

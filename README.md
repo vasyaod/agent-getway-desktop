@@ -124,7 +124,8 @@ reply. The rules are the Android app's `ReplyRules.java`, ported to `src/rules.j
 
 **The unread badge** counts chats with a reply you have not looked at. A chat counts as read
 once it is on screen in the focused window, or when you click its notification. The badge
-shows as a red dot on the tray icon (its tooltip gives the count), the count on the macOS dock
+shows on the tray icon, where the bubble turns solid with a dot in its corner (its tooltip
+gives the count), the count on the macOS dock
 icon, a dot overlay on the Windows taskbar button, and the count on Linux launchers that show
 badges (Unity, Dash to Dock). Signing out clears it.
 
@@ -148,8 +149,8 @@ navigation and permission rules, notifications, the badge, sign-out and window s
 
 `GETWAY_CHAT_SMOKE=<file>` starts the app in its launch check (`smoke()` in `src/main.js`,
 run by `ci/smoke.sh`). It uses a throwaway profile. It checks the window, the start page and
-its bridge, the tray and the UA marker, and that a signed-out visit to the gateway is turned
-back to the start page. It writes the result to `<file>` and exits. agent-getway runs one pod
+its bridge, the tray, that the packaged tray icons load (templates on macOS), the UA marker, and
+that a signed-out visit to the gateway is turned back to the start page. It writes the result to `<file>` and exits. agent-getway runs one pod
 with a Recreate rollout, so every deploy is minutes of 503: while the gateway answers 5xx or
 cannot be reached (in the probe or in the window's own load), the smoke tries it again with a
 back-off for up to 12 minutes, and lists each failed try in `attempts` (the probe's answer, the
@@ -169,6 +170,13 @@ registry, the same one as the Android app: a white speech bubble on **#29B6D1**.
 `resources/brand.json` is the registry record, and `resources/icon.png` is its PNG, byte for
 byte (`test/brand.test.mjs` checks the sha256). `npm run icons` (`scripts/make-icons.py`, needs
 Pillow) makes the app, window, tray and badge icons from that PNG. Commit the result.
+
+The app and window icons keep the brand colour. The tray icon is the bubble alone, monochrome
+like the other icons there, and drawn on whole pixels at 16, 24 and 32 px rather than scaled
+down from the PNG: white on Windows and Linux (`tray*.png`), and on macOS a template image
+(`tray*Template*.png`, black plus alpha) that the menu bar tints for light and dark mode. While
+replies are unread the bubble is solid, with a dot cut free in its top right corner
+([preview](docs/tray-icons.png)).
 
 ## Releases
 

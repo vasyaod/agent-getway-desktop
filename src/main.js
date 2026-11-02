@@ -234,9 +234,18 @@ function readOnScreen() {
 
 // ---- tray, badge, notifications -------------------------------------------------------------
 
+/** The tray icon: a white glyph on Windows and Linux; on macOS a template image (black plus
+ * alpha) that the menu bar tints for light and dark mode. */
+function trayImage(unread) {
+  const mac = process.platform === 'darwin';
+  const img = nativeImage.createFromPath(asset(`${unread ? 'tray-unread' : 'tray'}${mac ? 'Template' : ''}.png`));
+  if (mac) img.setTemplateImage(true);
+  return img;
+}
+
 function createTray() {
   try {
-    tray = new Tray(nativeImage.createFromPath(asset('tray.png')));
+    tray = new Tray(trayImage(false));
   } catch {
     tray = null; // a Linux desktop with no tray: launching the app again shows the window
     return;
@@ -252,7 +261,7 @@ function createTray() {
 
 function showBadge(n) {
   if (tray) {
-    tray.setImage(nativeImage.createFromPath(asset(n > 0 ? 'tray-unread.png' : 'tray.png')));
+    tray.setImage(trayImage(n > 0));
     tray.setToolTip(trayTooltip(n));
   }
   app.setBadgeCount(n); // the macOS dock; Linux launchers that support it
@@ -513,6 +522,11 @@ function smoke(file) {
     result.title = await wc.executeJavaScript('document.title');
     result.bridge = await wc.executeJavaScript('typeof window.getway');
     result.tray = !!tray;
+    // The packaged tray icons load: 16 px with their larger scales, templates on macOS.
+    result.tray_icons = [false, true].map((unread) => {
+      const img = trayImage(unread);
+      return { empty: img.isEmpty(), size: img.getSize(), scales: img.getScaleFactors(), template: img.isTemplateImage() };
+    });
     result.ua_marker = session.defaultSession.getUserAgent().includes(UA_MARKER);
     result.step = 'gateway guard';
     result.attempts = [];
@@ -538,7 +552,8 @@ function smoke(file) {
     result.guard = lastGuard;
     result.trace = trace;
     result.ok = result.title === 'Getway Chat' && result.bridge === 'object'
-      && result.ua_marker && result.guard === 'expired';
+      && result.ua_marker && result.guard === 'expired'
+      && result.tray_icons.every((i) => !i.empty && i.size.width === 16 && i.template === (process.platform === 'darwin'));
     if (result.ok || !result.gave_up_after_ms) result.step = 'done';
     clearTimeout(timer);
     finish(result.ok ? 0 : 1);
