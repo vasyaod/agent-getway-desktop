@@ -251,10 +251,12 @@ test('a refused start-page load (Electron ERR_FAILED) is retried, so a session t
 });
 
 /** The app in CI's smoke mode (GETWAY_CHAT_SMOKE): runs until it exits, returns its report. */
-async function smokeRun({ ms, setup = () => {} } = {}) {
+async function smokeRun({ ms, retryMs, setup = () => {} } = {}) {
   const report = path.join(mkdtempSync(path.join(tmpdir(), 'gc-smoke-')), 'report.json');
   process.env.GETWAY_CHAT_SMOKE = report;
   if (ms) process.env.GETWAY_CHAT_SMOKE_MS = String(ms);
+  if (retryMs) process.env.GETWAY_CHAT_SMOKE_RETRY_MS = String(retryMs);
+  process.env.GETWAY_CHAT_SMOKE_BACKOFF_MS = '1';
   try {
     reset({ userData: mkdtempSync(path.join(tmpdir(), 'gc-test-')) });
     setup();
@@ -263,6 +265,8 @@ async function smokeRun({ ms, setup = () => {} } = {}) {
   } finally {
     delete process.env.GETWAY_CHAT_SMOKE;
     delete process.env.GETWAY_CHAT_SMOKE_MS;
+    delete process.env.GETWAY_CHAT_SMOKE_RETRY_MS;
+    delete process.env.GETWAY_CHAT_SMOKE_BACKOFF_MS;
   }
   return { code: fake.exited, report: JSON.parse(readFileSync(report, 'utf8')) };
 }
@@ -318,6 +322,87 @@ test('smoke: the gateway page loading instead of redirecting fails the smoke and
   assert.equal(report.lastGuard, null);
   assert.equal(report.url, 'https://agent-getway.f-proj.com/');
   assert.ok(report.trace.some((t) => t.endsWith('did-redirect-navigation https://agent-getway.f-proj.com/')));
+});
+
+const G = 'https://agent-getway.f-proj.com/';
+const LOGIN = 'https://auth.f-proj.com/login?rd=https%3A%2F%2Fagent-getway.f-proj.com%2F';
+const DOWN = { response: { status: 503, headers: { server: 'traefik', 'content-type': 'text/plain' }, body: 'no available\n server' } };
+
+test('smoke: a gateway answering 503 (a Recreate rollout) is tried again until it redirects, and then passes', async () => {
+  net();
+  let probes = 0;
+  const { code, report } = await smokeRun({ setup: () => {
+    fake.status[G] = 503; // the window's own load gets the ingress's 503 page
+    fake.netAnswer = () => {
+      if (++probes <= 2) return DOWN;
+      delete fake.status[G]; // the new pod is up
+      fake.redirects[G] = LOGIN;
+      return { redirect: [302, LOGIN] };
+    };
+  } });
+  assert.equal(code, 0, JSON.stringify(report));
+  assert.equal(report.ok, true);
+  assert.equal(report.step, 'done');
+  assert.equal(report.guard, 'expired');
+  assert.equal(report.probe.answer, '302 https://auth.f-proj.com/login');
+  assert.equal(report.attempts.length, 2);
+  for (const [i, a] of report.attempts.entries()) {
+    assert.equal(a.n, i + 1);
+    assert.equal(a.probe.answer, '503');
+    assert.deepEqual(a.probe.headers, { server: 'traefik', 'content-type': 'text/plain' });
+    assert.equal(a.probe.body, 'no available server');
+    assert.equal(a.load, '503');
+    assert.deepEqual(a.trace.map((t) => t.replace(/^\d+ms /, '')),
+      ['http 503 https://agent-getway.f-proj.com/', 'did-finish-load https://agent-getway.f-proj.com/']);
+  }
+  assert.ok(report.trace.some((t) => t.endsWith('guard expired')), 'the passing attempt has its own trace');
+  assert.ok(!report.trace.some((t) => t.includes('http 503')), 'and only its own');
+});
+
+test('smoke: a refused gateway load (network error) is tried again, even when the probe got the redirect', async () => {
+  net();
+  let probes = 0;
+  const { code, report } = await smokeRun({ setup: () => {
+    fake.redirects[G] = LOGIN;
+    fake.netAnswer = () => {
+      if (++probes === 1) fake.refuseNextLoad = true; // the first gateway load, which comes next
+      return { redirect: [302, LOGIN] };
+    };
+  } });
+  assert.equal(code, 0, JSON.stringify(report));
+  assert.equal(report.guard, 'expired');
+  assert.equal(report.attempts.length, 1);
+  assert.equal(report.attempts[0].probe.answer, '302 https://auth.f-proj.com/login');
+  assert.equal(report.attempts[0].load, 'did-fail-load -2');
+});
+
+test('smoke: a gateway still down when the retry budget ends fails at "gateway guard" with every attempt', async () => {
+  net();
+  const { code, report } = await smokeRun({ retryMs: 40, setup: () => {
+    fake.status[G] = 503;
+    fake.netAnswer = DOWN;
+  } });
+  assert.equal(code, 1);
+  assert.equal(report.ok, false);
+  assert.equal(report.step, 'gateway guard');
+  assert.equal(report.guard, null);
+  assert.equal(typeof report.gave_up_after_ms, 'number');
+  assert.ok(report.attempts.length >= 1);
+  assert.equal(report.probe.answer, '503');
+  assert.equal(report.load, '503');
+  assert.equal(report.timeout_ms, undefined, 'it gave up by itself, not by the timer');
+});
+
+test('smoke: a 4xx from the gateway is an answer, not an outage: no retry', async () => {
+  net();
+  const { code, report } = await smokeRun({ ms: 300, setup: () => {
+    fake.status[G] = 403;
+    fake.netAnswer = { response: { status: 403 } };
+  } });
+  assert.equal(code, 1);
+  assert.deepEqual(report.attempts, []);
+  assert.equal(report.probe.answer, '403');
+  assert.equal(report.timeout_ms, 300);
 });
 
 test('an expired cookie is not a sign-in; offline shows Try again, which reopens the chat', async () => {
