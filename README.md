@@ -18,12 +18,15 @@ restarts. It runs in the tray, notifies you of new agent replies, and badges the
 
 Every release is on the [Releases](https://github.com/vasyaod/agent-getway-desktop/releases) page.
 
-The builds are **not code-signed**. Each OS asks once:
+The builds are **not signed with a publisher certificate**. Each OS asks once:
 
-- **macOS:** the app is not notarized, so the first open says it "cannot be opened" or "is
-  damaged". Drag it to Applications, then run
-  `xattr -dr com.apple.quarantine "/Applications/Getway Chat.app"` once, or right-click it
-  and choose **Open**.
+- **macOS:** the app is only ad-hoc signed (no Apple Developer ID) and not notarized, so
+  Gatekeeper blocks a copy downloaded in a browser: the first open says it "cannot be
+  opened", "is damaged" or "Apple could not verify" it. Drag it to Applications, then run
+  `xattr -dr com.apple.quarantine "/Applications/Getway Chat.app"` once. Or open it once,
+  close the dialog, and choose **Open Anyway** in System Settings → Privacy & Security.
+  On macOS 14 and earlier, right-click → **Open** also works; macOS 15 removed that. A copy
+  fetched with `gh release download` or `curl` is not quarantined and opens directly.
 - **Windows:** SmartScreen says "Windows protected your PC". Choose **More info**, then
   **Run anyway**. The installer installs for your user only and needs no admin rights.
 - **Linux:** run `chmod +x GetwayChat-linux-*.AppImage` first, or install the deb with
