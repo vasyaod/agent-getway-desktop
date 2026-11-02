@@ -1,6 +1,7 @@
 // Just enough of Electron's main-process API for src/main.js, recording what it is asked to do.
 // `fake` is the state a test reads and steers; reset() starts a fresh "launch".
 import { EventEmitter } from 'node:events';
+import { existsSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 export const fake = {};
@@ -179,7 +180,22 @@ export class Notification extends EventEmitter {
 
 export const ipcMain = { handle: (channel, fn) => { fake.handlers[channel] = fn; } };
 
-export const nativeImage = { createFromPath: (p) => ({ path: p }) };
+/** An image from a file: empty if there is none; its scales are the `@<n>x` files beside it. */
+export const nativeImage = {
+  createFromPath: (p) => ({
+    path: p,
+    template: false,
+    setTemplateImage(on) { this.template = on; },
+    isTemplateImage() { return this.template; },
+    isEmpty: () => !existsSync(p),
+    getSize() { // the PNG's IHDR
+      if (!existsSync(p)) return { width: 0, height: 0 };
+      const png = readFileSync(p);
+      return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
+    },
+    getScaleFactors: () => (existsSync(p) ? [1, 1.5, 2].filter((f) => f === 1 || existsSync(p.replace(/\.png$/, `@${f}x.png`))) : []),
+  }),
+};
 
 export const screen = { getAllDisplays: () => [{ workArea: { x: 0, y: 0, width: 1920, height: 1080 } }] };
 

@@ -10,8 +10,9 @@ test('the icon is the Getway Chat registry PNG, and every derived icon is there'
   assert.equal(brand.name, 'Getway Chat');
   const sha = createHash('sha256').update(readFileSync(new URL('resources/icon.png', root))).digest('hex');
   assert.equal(sha, brand.sha256);
-  for (const f of ['build/icon.png', 'src/assets/icon.png', 'src/assets/tray.png', 'src/assets/tray@2x.png',
-    'src/assets/tray-unread.png', 'src/assets/tray-unread@2x.png', 'src/assets/overlay-unread.png']) {
+  const trays = ['tray', 'tray-unread'].flatMap((t) => [`${t}.png`, `${t}@1.5x.png`, `${t}@2x.png`,
+    `${t}Template.png`, `${t}Template@2x.png`]).map((f) => `src/assets/${f}`);
+  for (const f of ['build/icon.png', 'src/assets/icon.png', ...trays, 'src/assets/overlay-unread.png']) {
     assert.ok(existsSync(new URL(f, root)), f);
   }
   const css = readFileSync(new URL('src/start/styles.css', root), 'utf8');
