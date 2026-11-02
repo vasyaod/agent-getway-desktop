@@ -9,6 +9,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const FORMATS = { mac: ['dmg', 'zip'], win: ['exe'], linux: ['AppImage', 'deb'] };
+// Any installer electron-builder writes for us, whatever its arch part (blockmaps, yml: no).
+const INSTALLER = /^GetwayChat-.*\.(dmg|zip|exe|AppImage|deb)$/;
 const ARCH = { x64: 'x64', x86_64: 'x64', amd64: 'x64', arm64: 'arm64', aarch64: 'arm64' };
 
 /** GetwayChat-<os>-<arch>.<ext> for one of our build outputs, or null for anything else. */
@@ -25,9 +27,13 @@ export function collect(platform, arch, dist = 'dist', out = 'out') {
   mkdirSync(out, { recursive: true });
   const got = [];
   for (const f of readdirSync(dist)) {
+    if (!INSTALLER.test(f)) continue;
     const name = canonicalName(f);
-    if (!name) continue;
-    if (!expected(platform, arch).includes(name)) throw new Error(`unexpected build output ${f} (${name})`);
+    // Another arch's installer, or a multi-arch one (NSIS names it GetwayChat-win.exe): the
+    // package.json targets must not list archs, or `--x64` builds arm64 too.
+    if (!name || !expected(platform, arch).includes(name)) {
+      throw new Error(`unexpected build output ${f}${name ? ` (${name})` : ''}: not ${platform}/${arch} only; package.json "build" targets must leave the arch to the CLI`);
+    }
     copyFileSync(path.join(dist, f), path.join(out, name));
     got.push(name);
   }
