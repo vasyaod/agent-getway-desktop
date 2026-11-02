@@ -146,7 +146,13 @@ navigation and permission rules, notifications, the badge, sign-out and window s
 `GETWAY_CHAT_SMOKE=<file>` starts the app in its launch check (`smoke()` in `src/main.js`,
 run by `ci/smoke.sh`). It uses a throwaway profile. It checks the window, the start page and
 its bridge, the tray and the UA marker, and that a signed-out visit to the gateway is turned
-back to the start page. It writes the result to `<file>` and exits.
+back to the start page. It writes the result to `<file>` and exits. If 60 s pass first, the
+result also says what the app knew then: `lastGuard`, the URL on screen, whether it was still
+loading, a `trace` of the main-frame navigation events and guard steps since the gateway load
+began, and a `probe`: what one plain request to the gateway got (status and Location, or the
+network error). The stand-in in `test/fake-electron` replays Electron 45's event order for a
+redirect cancelled from `will-redirect`. It does not model Chromium's timing or the network,
+so the CI smoke is the only real test of that path.
 
 ## Brand
 

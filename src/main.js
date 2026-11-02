@@ -10,7 +10,7 @@
 // Chromium persists (encrypted with the OS keychain where there is one) across restarts. The
 // gateway's SSO reads that cookie like any browser session; the reply watcher reads it back here
 // and sends it as `Authorization: Bearer`. No page can read it and it is never logged.
-import { app, BrowserWindow, Menu, Notification, Tray, ipcMain, nativeImage, screen, session, shell, systemPreferences } from 'electron';
+import { app, BrowserWindow, Menu, Notification, Tray, ipcMain, nativeImage, net, screen, session, shell, systemPreferences } from 'electron';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,7 +29,25 @@ const asset = (name) => path.join(here, 'assets', name);
 // GETWAY_CHAT_SMOKE=<file>: CI's launch check (smoke() below). It runs on a throwaway profile,
 // so it can never touch a real sign-in.
 const SMOKE = process.env.GETWAY_CHAT_SMOKE || '';
+const SMOKE_MS = Number(process.env.GETWAY_CHAT_SMOKE_MS) || 60_000; // tests shorten it
 if (SMOKE) app.setPath('userData', path.join(tmpdir(), `getway-chat-smoke-${process.pid}`));
+
+// Smoke only: what the window and the guard did since the gateway load started, so a red run
+// names the step that never came (smoke()). URLs without their query; nothing else is recorded.
+const trace = [];
+let traceFrom = 0;
+function mark(what, url) {
+  if (!traceFrom || trace.length >= 60) return;
+  trace.push(`${Date.now() - traceFrom}ms ${what}${url === undefined ? '' : ` ${shortUrl(url)}`}`);
+}
+function shortUrl(raw) {
+  try {
+    const u = new URL(String(raw));
+    return u.protocol === 'file:' ? `file:…/${path.basename(u.pathname)}` : `${u.origin}${u.pathname}`;
+  } catch {
+    return String(raw).slice(0, 60);
+  }
+}
 
 const dataFile = (name) => path.join(app.getPath('userData'), name);
 
@@ -131,11 +149,17 @@ function createWindow() {
     if (kind === 'external' || kind === 'gateway') shell.openExternal(url);
     return { action: 'deny' };
   });
-  wc.on('will-navigate', (e) => guard(e, e.url));
-  wc.on('will-redirect', (e) => { if (e.isMainFrame) guard(e, e.url); });
+  wc.on('will-navigate', (e) => { mark('will-navigate', e.url); guard(e, e.url); });
+  wc.on('will-redirect', (e) => { if (e.isMainFrame) { mark('will-redirect', e.url); guard(e, e.url); } });
+  wc.on('did-start-navigation', (e) => { if (e.isMainFrame && !e.isSameDocument) mark('did-start-navigation', e.url); });
+  wc.on('did-redirect-navigation', (e) => { if (e.isMainFrame) mark('did-redirect-navigation', e.url); });
+  wc.on('did-finish-load', () => mark('did-finish-load', wc.getURL()));
+  wc.on('did-stop-loading', () => mark('did-stop-loading'));
+  wc.on('render-process-gone', (_e, d) => mark(`render-process-gone ${d?.reason}`));
   wc.on('did-navigate', () => readOnScreen());
   wc.on('did-navigate-in-page', (_e, _url, isMainFrame) => { if (isMainFrame) readOnScreen(); });
   wc.on('did-fail-load', (_e, code, _desc, url, isMainFrame) => {
+    if (isMainFrame) mark(`did-fail-load ${code}`, url);
     // -3 ERR_ABORTED is our own guard cancelling a load.
     if (isMainFrame && code !== -3 && classify(url) === 'gateway') {
       stopPolling();
@@ -152,7 +176,10 @@ function guard(e, url) {
   if (kind === 'external') shell.openExternal(url);
   else if (kind === 'signed_out' || kind === 'expired') {
     lastGuard = kind;
-    endSession(kind);
+    mark(`guard ${kind}`);
+    // Not on this stack: Chromium is still inside the navigation we just cancelled, and a load
+    // started from here can be refused or swallowed with it. The next task starts clean.
+    setImmediate(() => endSession(kind));
   }
 }
 
@@ -169,7 +196,21 @@ function openChat(chatId) {
 
 function showStart(next) {
   setStatus({ phase: 'idle', message: null, error: false, ...next });
-  win.loadFile(START).catch(() => {});
+  loadStart(true);
+}
+
+/**
+ * The start page, whatever the window was doing. A load another navigation replaced
+ * (ERR_ABORTED) is left alone: that one is newer. Any other failure, e.g. Electron refusing to
+ * start a load while a cancelled one is still unwinding (ERR_FAILED), is retried once, a moment
+ * later, so a session that ended never leaves the window stuck on the gateway.
+ */
+function loadStart(retry) {
+  mark('loadFile start');
+  win.loadFile(START).then(() => mark('loadFile ok'), (err) => {
+    mark(`loadFile failed ${err?.errno ?? ''} ${err?.code ?? ''}`.trim());
+    if (retry && err?.code !== 'ERR_ABORTED' && win && !win.isDestroyed()) setTimeout(() => loadStart(false), 250);
+  });
 }
 
 /** The chat on screen in a focused window, or null. */
@@ -254,6 +295,9 @@ async function clearCookie() {
   await cookies.flushStore().catch(() => {});
 }
 
+/** `promise`, but given up on after `ms`: what ends a session must never hang the window. */
+const atMost = (promise, ms) => Promise.race([promise, new Promise((r) => { setTimeout(r, ms).unref?.(); })]);
+
 function setStatus(next) {
   status = { ...status, ...next, version: app.getVersion() };
   if (win && !win.isDestroyed()) win.webContents.send('getway:status', status);
@@ -285,19 +329,25 @@ async function signIn() {
 
 /** The gateway sent us to auth.f-proj.com, or the watcher got a 401: back to Sign in. */
 async function endSession(kind) {
+  mark(`endSession ${kind}`);
   const token = current?.token;
   current = null;
   stopPolling();
-  await clearCookie();
-  if (kind === 'signed_out') await revoke(token); // only this app's token
-  resetReplies();
-  unread.clear();
-  for (const note of notes.values()) note.close();
-  notes.clear();
-  showStart({
-    phase: 'idle', error: false,
-    message: kind === 'signed_out' ? 'You signed out.' : 'Your sign-in ended. Sign in again.',
-  });
+  try {
+    await atMost(clearCookie(), 5_000);
+    mark('cookie cleared');
+    if (kind === 'signed_out') await revoke(token); // only this app's token; 10 s at most
+    resetReplies();
+    unread.clear();
+    for (const note of notes.values()) note.close();
+    notes.clear();
+  } finally {
+    // Whatever failed above, the window goes back to Sign in.
+    showStart({
+      phase: 'idle', error: false,
+      message: kind === 'signed_out' ? 'You signed out.' : 'Your sign-in ended. Sign in again.',
+    });
+  }
 }
 
 function resetReplies() {
@@ -392,13 +442,23 @@ function guardPermissions(ses) {
  * the bridge, the tray icon exists, and the gateway, opened signed out, is turned back to the
  * start page by the sign-in guard (a real round trip to agent-getway.f-proj.com, whose SSO
  * redirects to auth.f-proj.com/login). Writes the result as JSON and exits 0 only if all held.
+ *
+ * If the time runs out, the report says what the app knew then: the step, `lastGuard`, the URL
+ * on screen, whether it was still loading, the main-frame events since the gateway load started
+ * (`trace`), and what a plain request to the gateway got (`probe`: its status and Location, or
+ * its network error), so a red run tells "the gateway never answered", "the guard never fired",
+ * "the session never ended" and "the start page load failed" apart.
  */
 function smoke(file) {
   const wc = win.webContents;
   const result = { ok: false, step: 'start page', version: app.getVersion(), platform: process.platform,
     arch: process.arch, electron: process.versions.electron };
   const finish = (code) => { writeJson(file, result); app.exit(code); };
-  const timer = setTimeout(() => finish(1), 60_000);
+  const timer = setTimeout(() => {
+    Object.assign(result, { timeout_ms: SMOKE_MS, lastGuard, url: shortUrl(wc.getURL()),
+      loading: wc.isLoading(), trace });
+    finish(1);
+  }, SMOKE_MS);
   const startLoaded = () => new Promise((resolve) => {
     const check = () => {
       if (wc.getURL().startsWith('file:')) { wc.off('did-finish-load', check); resolve(); }
@@ -413,14 +473,45 @@ function smoke(file) {
     result.tray = !!tray;
     result.ua_marker = session.defaultSession.getUserAgent().includes(UA_MARKER);
     result.step = 'gateway guard';
+    result.probe = probeGateway();
+    traceFrom = Date.now();
     const back = startLoaded();
     win.loadURL(GATEWAY).catch(() => {});
     await back;
     result.guard = lastGuard;
+    result.trace = trace;
     result.ok = result.title === 'Getway Chat' && result.bridge === 'object'
       && result.ua_marker && result.guard === 'expired';
     result.step = 'done';
     clearTimeout(timer);
     finish(result.ok ? 0 : 1);
   })().catch((e) => { result.error = String(e && e.message); clearTimeout(timer); finish(1); });
+}
+
+/**
+ * One signed-out GET of the gateway through the app's own session (its proxy, DNS and user
+ * agent; no cookies), redirects not followed. Fills in the returned object as it answers.
+ */
+function probeGateway() {
+  const out = { answer: 'none yet' };
+  const t0 = Date.now();
+  let req;
+  const done = (answer) => {
+    if (out.answer !== 'none yet') return;
+    Object.assign(out, { answer, ms: Date.now() - t0 });
+    clearTimeout(timer);
+    try { req.abort(); } catch { /* already finished */ }
+  };
+  const timer = setTimeout(() => done('no answer in 20 s'), 20_000);
+  try {
+    req = net.request({ url: GATEWAY, session: session.defaultSession, useSessionCookies: false, redirect: 'manual' });
+    req.setHeader('Accept', 'text/html');
+    req.on('redirect', (status, _method, location) => done(`${status} ${shortUrl(location)}`));
+    req.on('response', (res) => done(`${res.statusCode}`));
+    req.on('error', (err) => done(`error ${err?.message}`));
+    req.end();
+  } catch (err) {
+    done(`error ${err?.message}`);
+  }
+  return out;
 }

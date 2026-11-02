@@ -240,6 +240,86 @@ test('a session that ended (redirect to /login, or a 401 to the watcher) forgets
   quit();
 });
 
+test('a refused start-page load (Electron ERR_FAILED) is retried, so a session that ended still lands on Sign in', async () => {
+  net();
+  const win = await launch({ cookies: [liveCookie()] });
+  fake.refuseNextLoad = true;
+  assert.equal(win.webContents.navigate('https://auth.f-proj.com/login?rd=x', 'will-redirect'), false);
+  await until(() => win.webContents.url === START, 'the start page after the retry');
+  assert.equal(fake.refuseNextLoad, false, 'the first load was the refused one');
+  quit();
+});
+
+/** The app in CI's smoke mode (GETWAY_CHAT_SMOKE): runs until it exits, returns its report. */
+async function smokeRun({ ms, setup = () => {} } = {}) {
+  const report = path.join(mkdtempSync(path.join(tmpdir(), 'gc-smoke-')), 'report.json');
+  process.env.GETWAY_CHAT_SMOKE = report;
+  if (ms) process.env.GETWAY_CHAT_SMOKE_MS = String(ms);
+  try {
+    reset({ userData: mkdtempSync(path.join(tmpdir(), 'gc-test-')) });
+    setup();
+    await import(`../src/main.js?launch=${++launches}`);
+    await until(() => fake.exited !== null, 'the smoke to exit');
+  } finally {
+    delete process.env.GETWAY_CHAT_SMOKE;
+    delete process.env.GETWAY_CHAT_SMOKE_MS;
+  }
+  return { code: fake.exited, report: JSON.parse(readFileSync(report, 'utf8')) };
+}
+
+test('smoke: a signed-out gateway visit is redirected to /login, cancelled, and comes back to the start page', async () => {
+  net();
+  const { code, report } = await smokeRun({ setup: () => {
+    fake.redirects['https://agent-getway.f-proj.com/'] = 'https://auth.f-proj.com/login?rd=https%3A%2F%2Fagent-getway.f-proj.com%2F';
+  } });
+  assert.equal(code, 0, JSON.stringify(report));
+  assert.equal(report.ok, true);
+  assert.equal(report.step, 'done');
+  assert.equal(report.guard, 'expired');
+  assert.deepEqual(report.probe.answer, '302 https://auth.f-proj.com/login');
+  const steps = report.trace.map((t) => t.replace(/^\d+ms /, ''));
+  assert.deepEqual(steps, [
+    'did-start-navigation https://agent-getway.f-proj.com/',
+    'will-redirect https://auth.f-proj.com/login',
+    'guard expired',
+    'did-stop-loading',
+    'endSession expired',
+    'cookie cleared',
+    'loadFile start',
+    'did-finish-load file:…/index.html', // the smoke reports here, before the load's promise settles
+  ]);
+  assert.equal(fake.windows[0].webContents.loads.includes('https://auth.f-proj.com/login?rd=https%3A%2F%2Fagent-getway.f-proj.com%2F'), false,
+    'auth.f-proj.com never loads in the window');
+});
+
+test('smoke: when time runs out the report names the step, the URL, lastGuard, the trace and the probe', async () => {
+  net();
+  const { code, report } = await smokeRun({ ms: 300, setup: () => {
+    fake.hang.add('https://agent-getway.f-proj.com/');
+    fake.netAnswer = { error: 'net::ERR_CONNECTION_TIMED_OUT' };
+  } });
+  assert.equal(code, 1);
+  assert.equal(report.ok, false);
+  assert.equal(report.step, 'gateway guard');
+  assert.equal(report.timeout_ms, 300);
+  assert.equal(report.lastGuard, null);
+  assert.equal(report.url, 'file:…/index.html');
+  assert.equal(report.loading, true);
+  assert.deepEqual(report.trace.map((t) => t.replace(/^\d+ms /, '')), ['did-start-navigation https://agent-getway.f-proj.com/']);
+  assert.match(report.probe.answer, /^error net::ERR_CONNECTION_TIMED_OUT$/);
+});
+
+test('smoke: the gateway page loading instead of redirecting fails the smoke and says so', async () => {
+  net();
+  const { code, report } = await smokeRun({ ms: 300, setup: () => {
+    fake.redirects['https://agent-getway.f-proj.com/'] = 'https://agent-getway.f-proj.com/#/chat';
+  } });
+  assert.equal(code, 1);
+  assert.equal(report.lastGuard, null);
+  assert.equal(report.url, 'https://agent-getway.f-proj.com/');
+  assert.ok(report.trace.some((t) => t.endsWith('did-redirect-navigation https://agent-getway.f-proj.com/')));
+});
+
 test('an expired cookie is not a sign-in; offline shows Try again, which reopens the chat', async () => {
   net();
   let win = await launch({ cookies: [{ ...liveCookie(), expirationDate: Date.now() / 1000 + 30 }] });

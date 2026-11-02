@@ -22,6 +22,14 @@ export function reset({ userData, cookies = [], focused = true } = {}) {
     permissionCheck: null,
     permissionRequest: null,
     onOpenExternal: null,
+    // What a loadURL() of a URL gets from the "server", for the real-load path (WebContents.load):
+    //   redirects[url] = location   a 3xx to `location`;   hang = Set of URLs that never answer.
+    // URLs in neither commit at once, as before.
+    redirects: {},
+    hang: new Set(),
+    refuseNextLoad: false, // the next loadURL fails with ERR_FAILED and starts no navigation
+    netAnswer: { redirect: [302, 'https://auth.f-proj.com/login?rd=x'] }, // net.request()
+    pageJs: { 'document.title': 'Getway Chat', 'typeof window.getway': 'object' }, // executeJavaScript
   });
 }
 reset();
@@ -44,8 +52,8 @@ class WebContents extends EventEmitter {
   setWindowOpenHandler(fn) { this.openHandler = fn; }
   send(channel, data) { this.sent.push([channel, data]); }
   getURL() { return this.url; }
-  isLoading() { return false; }
-  async executeJavaScript() { return null; }
+  isLoading() { return !!this.pending; }
+  async executeJavaScript(code) { return fake.pageJs[code] ?? null; }
   /** A page-initiated navigation: returns true if main.js let it through. */
   navigate(url, ev = 'will-navigate') {
     let prevented = false;
@@ -60,6 +68,66 @@ class WebContents extends EventEmitter {
     this.loads.push(url);
     this.emit('did-navigate', {}, url);
     this.emit('did-finish-load');
+  }
+
+  /**
+   * loadURL/loadFile. A URL with a scripted redirect or hang goes through the event sequence of
+   * Electron 45's own code (shell/browser/electron_navigation_throttle.cc, api/load_url_promises.cc
+   * and DidFinishNavigation in api/electron_api_web_contents.cc), one task per network step:
+   * did-start-navigation, then will-redirect with the details object. preventDefault() cancels
+   * the navigation as the throttle's CANCEL does: no commit, no did-fail-load (an uncommitted
+   * ERR_ABORTED emits none), did-stop-loading, and the load's promise rejects with ERR_FAILED.
+   * Not prevented: did-redirect-navigation, then it commits the redirect target. A newer load
+   * replaces a pending one, whose promise rejects with ERR_ABORTED. Chromium's own timing (when
+   * the cancelled request is really torn down) and the network are not modelled.
+   */
+  load(url) {
+    if (fake.refuseNextLoad) {
+      fake.refuseNextLoad = false;
+      this.emit('did-fail-load', {}, -2, 'ERR_FAILED', url, true);
+      return Promise.reject(Object.assign(new Error('ERR_FAILED (-2)'), { errno: -2, code: 'ERR_FAILED' }));
+    }
+    const location = fake.redirects[url];
+    if (location === undefined && !fake.hang.has(url)) {
+      this.replacePending();
+      this.go(url);
+      return Promise.resolve();
+    }
+    this.replacePending();
+    return new Promise((resolve, reject) => {
+      const nav = { reject };
+      this.pending = nav;
+      const live = () => this.pending === nav;
+      this.emit('did-start-navigation', { url, isMainFrame: true, isSameDocument: false });
+      if (fake.hang.has(url)) return;
+      setImmediate(() => {
+        if (!live()) return;
+        let prevented = false;
+        const e = { url: location, isMainFrame: true, isSameDocument: false, preventDefault: () => { prevented = true; } };
+        this.emit('will-redirect', e, location, false, true);
+        if (prevented) {
+          this.pending = null;
+          this.emit('did-stop-loading');
+          reject(Object.assign(new Error('ERR_FAILED (-2)'), { errno: -2, code: 'ERR_FAILED' }));
+          return;
+        }
+        this.emit('did-redirect-navigation', { url: location, isMainFrame: true, isSameDocument: false });
+        setImmediate(() => {
+          if (!live()) return;
+          this.pending = null;
+          this.go(location);
+          this.emit('did-stop-loading');
+          resolve();
+        });
+      });
+    });
+  }
+
+  replacePending() {
+    if (!this.pending) return;
+    const { reject } = this.pending;
+    this.pending = null;
+    reject(Object.assign(new Error('ERR_ABORTED (-3)'), { errno: -3, code: 'ERR_ABORTED' }));
   }
 }
 
@@ -86,8 +154,8 @@ export class BrowserWindow extends EventEmitter {
   isFullScreen() { return false; }
   getNormalBounds() { return { x: this.opts.x ?? 10, y: this.opts.y ?? 20, width: this.opts.width, height: this.opts.height }; }
   setOverlayIcon(img, text) { this.overlay.push([img, text]); }
-  loadURL(url) { this.webContents.go(url); return Promise.resolve(); }
-  loadFile(p) { this.webContents.go(pathToFileURL(p).href); return Promise.resolve(); }
+  loadURL(url) { return this.webContents.load(url); }
+  loadFile(p) { return this.webContents.load(pathToFileURL(p).href); }
 }
 
 export class Tray extends EventEmitter {
@@ -135,4 +203,20 @@ export const shell = {
 
 export const systemPreferences = { askForMediaAccess: async () => true };
 
-export default { app, BrowserWindow, Tray, Menu, Notification, ipcMain, nativeImage, screen, session, shell, systemPreferences };
+/** net.request: answers with fake.netAnswer ({redirect: [status, location]} or {error}). */
+export const net = {
+  request(opts) {
+    const req = new EventEmitter();
+    fake.netRequests = [...(fake.netRequests || []), opts];
+    req.setHeader = () => {};
+    req.abort = () => {};
+    req.end = () => setImmediate(() => {
+      const a = fake.netAnswer;
+      if (a.error) req.emit('error', new Error(a.error));
+      else if (a.redirect) req.emit('redirect', a.redirect[0], 'GET', a.redirect[1], {});
+    });
+    return req;
+  },
+};
+
+export default { app, BrowserWindow, Tray, Menu, Notification, ipcMain, nativeImage, net, screen, session, shell, systemPreferences };
