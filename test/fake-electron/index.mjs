@@ -27,8 +27,11 @@ export function reset({ userData, cookies = [], focused = true } = {}) {
     // URLs in neither commit at once, as before.
     redirects: {},
     hang: new Set(),
+    status: {}, // status[url] = the HTTP status a committed load of url reports (did-navigate); 200
     refuseNextLoad: false, // the next loadURL fails with ERR_FAILED and starts no navigation
-    netAnswer: { redirect: [302, 'https://auth.f-proj.com/login?rd=x'] }, // net.request()
+    // net.request(): {redirect: [status, location]}, {response: {status, headers, body}} or {error};
+    // or a function returning one, called once per request.
+    netAnswer: { redirect: [302, 'https://auth.f-proj.com/login?rd=x'] },
     pageJs: { 'document.title': 'Getway Chat', 'typeof window.getway': 'object' }, // executeJavaScript
   });
 }
@@ -66,7 +69,7 @@ class WebContents extends EventEmitter {
   go(url) {
     this.url = url;
     this.loads.push(url);
-    this.emit('did-navigate', {}, url);
+    this.emit('did-navigate', {}, url, fake.status[url] ?? 200, '');
     this.emit('did-finish-load');
   }
 
@@ -203,7 +206,7 @@ export const shell = {
 
 export const systemPreferences = { askForMediaAccess: async () => true };
 
-/** net.request: answers with fake.netAnswer ({redirect: [status, location]} or {error}). */
+/** net.request: answers with fake.netAnswer (see reset()). */
 export const net = {
   request(opts) {
     const req = new EventEmitter();
@@ -211,9 +214,15 @@ export const net = {
     req.setHeader = () => {};
     req.abort = () => {};
     req.end = () => setImmediate(() => {
-      const a = fake.netAnswer;
+      const a = typeof fake.netAnswer === 'function' ? fake.netAnswer() : fake.netAnswer;
       if (a.error) req.emit('error', new Error(a.error));
       else if (a.redirect) req.emit('redirect', a.redirect[0], 'GET', a.redirect[1], {});
+      else if (a.response) {
+        const res = new EventEmitter();
+        Object.assign(res, { statusCode: a.response.status, headers: a.response.headers || {} });
+        req.emit('response', res);
+        setImmediate(() => { if (a.response.body) res.emit('data', Buffer.from(a.response.body)); res.emit('end'); });
+      }
     });
     return req;
   },

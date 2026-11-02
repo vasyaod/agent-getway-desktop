@@ -146,7 +146,12 @@ navigation and permission rules, notifications, the badge, sign-out and window s
 `GETWAY_CHAT_SMOKE=<file>` starts the app in its launch check (`smoke()` in `src/main.js`,
 run by `ci/smoke.sh`). It uses a throwaway profile. It checks the window, the start page and
 its bridge, the tray and the UA marker, and that a signed-out visit to the gateway is turned
-back to the start page. It writes the result to `<file>` and exits. If 60 s pass first, the
+back to the start page. It writes the result to `<file>` and exits. agent-getway runs one pod
+with a Recreate rollout, so every deploy is minutes of 503: while the gateway answers 5xx or
+cannot be reached (in the probe or in the window's own load), the smoke tries it again with a
+back-off for up to 12 minutes, and lists each failed try in `attempts` (the probe's answer, the
+5xx's `server`, `x-sso-status` and `content-type` headers and body start, and what the load
+got). Only the guard turning a real redirect back passes. If one try runs 60 s, the
 result also says what the app knew then: `lastGuard`, the URL on screen, whether it was still
 loading, a `trace` of the main-frame navigation events and guard steps since the gateway load
 began, and a `probe`: what one plain request to the gateway got (status and Location, or the

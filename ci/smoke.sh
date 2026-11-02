@@ -2,7 +2,9 @@
 # Launches the packaged app on this runner in its smoke mode (src/main.js smoke()) and checks
 # what it reports: the window and start page with its bridge, the tray, the UA marker, and the
 # sign-in guard turning a signed-out visit to agent-getway.f-proj.com back to the start page.
-# The app runs on a throwaway profile and exits by itself (60 s at most).
+# The app runs on a throwaway profile and exits by itself: in seconds, or, while the gateway
+# answers 5xx or cannot be reached (agent-getway's Recreate rollout), after retrying it for up
+# to 12 minutes (src/main.js SMOKE_RETRY_MS); each attempt has 60 s.
 #
 #   ci/smoke.sh <linux|mac|win>      after `electron-builder` + `ci/collect.mjs`
 set -euo pipefail
@@ -32,4 +34,5 @@ esac
 cat "$report"; echo
 node -e 'const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
   if (!r.ok) { console.error(`smoke failed at: ${r.step}`); process.exit(1); }
-  console.log(`smoke ok: Getway Chat ${r.version} on ${r.platform}/${r.arch}, Electron ${r.electron}`);' "$report"
+  console.log(`smoke ok: Getway Chat ${r.version} on ${r.platform}/${r.arch}, Electron ${r.electron}` +
+    `, gateway retries: ${(r.attempts || []).length}`);' "$report"

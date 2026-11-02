@@ -30,6 +30,11 @@ const asset = (name) => path.join(here, 'assets', name);
 // so it can never touch a real sign-in.
 const SMOKE = process.env.GETWAY_CHAT_SMOKE || '';
 const SMOKE_MS = Number(process.env.GETWAY_CHAT_SMOKE_MS) || 60_000; // tests shorten it
+// While the gateway answers 5xx or cannot be reached, the smoke tries it again for this long:
+// agent-getway runs one pod with a Recreate rollout, so each deploy is minutes of 503 (8.5 min
+// seen). The retries wait BACKOFF, 2x, 4x… capped at 6x between attempts. Tests shorten both.
+const SMOKE_RETRY_MS = Number(process.env.GETWAY_CHAT_SMOKE_RETRY_MS) || 12 * 60_000;
+const SMOKE_BACKOFF_MS = Number(process.env.GETWAY_CHAT_SMOKE_BACKOFF_MS) || 5_000;
 if (SMOKE) app.setPath('userData', path.join(tmpdir(), `getway-chat-smoke-${process.pid}`));
 
 // Smoke only: what the window and the guard did since the gateway load started, so a red run
@@ -443,27 +448,64 @@ function guardPermissions(ses) {
  * start page by the sign-in guard (a real round trip to agent-getway.f-proj.com, whose SSO
  * redirects to auth.f-proj.com/login). Writes the result as JSON and exits 0 only if all held.
  *
- * If the time runs out, the report says what the app knew then: the step, `lastGuard`, the URL
- * on screen, whether it was still loading, the main-frame events since the gateway load started
- * (`trace`), and what a plain request to the gateway got (`probe`: its status and Location, or
- * its network error), so a red run tells "the gateway never answered", "the guard never fired",
- * "the session never ended" and "the start page load failed" apart.
+ * A gateway that is down (a 5xx, or a network error, in the probe or in the window's own load)
+ * is not a verdict on the app: that attempt goes into `attempts` (its probe answer, headers and
+ * body start, and what the window's load got) and the gateway is tried again after a back-off,
+ * for SMOKE_RETRY_MS in all. Only the guard turning a real redirect back passes.
+ *
+ * If the time of an attempt (SMOKE_MS) runs out, the report says what the app knew then: the
+ * step, `lastGuard`, the URL on screen, whether it was still loading, the main-frame events
+ * since that attempt's gateway load started (`trace`), and what a plain request to the gateway
+ * got (`probe`: its status and Location, or its network error), so a red run tells "the gateway
+ * never answered", "the guard never fired", "the session never ended" and "the start page load
+ * failed" apart.
  */
 function smoke(file) {
   const wc = win.webContents;
   const result = { ok: false, step: 'start page', version: app.getVersion(), platform: process.platform,
     arch: process.arch, electron: process.versions.electron };
   const finish = (code) => { writeJson(file, result); app.exit(code); };
-  const timer = setTimeout(() => {
-    Object.assign(result, { timeout_ms: SMOKE_MS, lastGuard, url: shortUrl(wc.getURL()),
-      loading: wc.isLoading(), trace });
-    finish(1);
-  }, SMOKE_MS);
+  let timer = null;
+  const arm = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      Object.assign(result, { timeout_ms: SMOKE_MS, lastGuard, url: shortUrl(wc.getURL()),
+        loading: wc.isLoading(), trace });
+      finish(1);
+    }, SMOKE_MS);
+  };
+  arm();
   const startLoaded = () => new Promise((resolve) => {
     const check = () => {
       if (wc.getURL().startsWith('file:')) { wc.off('did-finish-load', check); resolve(); }
     };
     wc.on('did-finish-load', check);
+  });
+
+  /**
+   * One gateway visit. Resolves when the start page is back (the guard, or the offline page),
+   * or the gateway answered 5xx: with what the load got if the gateway was down, else null.
+   */
+  const visit = () => new Promise((resolve) => {
+    let down = null;
+    const onNavigate = (_e, url, code) => {
+      if (code >= 500 && classify(url) === 'gateway') { down = `${code}`; mark(`http ${code}`, url); settle(); }
+    };
+    const onFail = (_e, code, _desc, url, isMainFrame) => {
+      if (isMainFrame && code !== -3 && classify(url) === 'gateway') down = `did-fail-load ${code}`;
+    };
+    const onFinish = () => { if (wc.getURL().startsWith('file:')) settle(); };
+    function settle() {
+      wc.off('did-navigate', onNavigate);
+      wc.off('did-fail-load', onFail);
+      wc.off('did-finish-load', onFinish);
+      resolve(down);
+    }
+    wc.on('did-navigate', onNavigate);
+    // Ahead of the window's own did-fail-load handler, whose offline page would settle us first.
+    wc.prependListener('did-fail-load', onFail);
+    wc.on('did-finish-load', onFinish);
+    win.loadURL(GATEWAY).catch(() => {});
   });
 
   (async () => {
@@ -473,45 +515,79 @@ function smoke(file) {
     result.tray = !!tray;
     result.ua_marker = session.defaultSession.getUserAgent().includes(UA_MARKER);
     result.step = 'gateway guard';
-    result.probe = probeGateway();
-    traceFrom = Date.now();
-    const back = startLoaded();
-    win.loadURL(GATEWAY).catch(() => {});
-    await back;
+    result.attempts = [];
+    const t0 = Date.now();
+    for (let n = 1; ; n++) {
+      arm();
+      lastGuard = null;
+      traceFrom = 0;
+      trace.length = 0;
+      result.probe = await probeGateway();
+      traceFrom = Date.now();
+      const load = await visit();
+      result.load = load || 'not down';
+      if (lastGuard === 'expired') break;
+      const down = gatewayDown(result.probe.answer) || load;
+      const wait = Math.min(SMOKE_BACKOFF_MS * 2 ** (n - 1), 6 * SMOKE_BACKOFF_MS);
+      if (!down) break;
+      if (Date.now() + wait - t0 > SMOKE_RETRY_MS) { result.gave_up_after_ms = Date.now() - t0; break; }
+      result.attempts.push({ n, at_ms: Date.now() - t0, probe: result.probe, load: result.load, trace: [...trace] });
+      clearTimeout(timer);
+      await new Promise((r) => { setTimeout(r, wait); });
+    }
     result.guard = lastGuard;
     result.trace = trace;
     result.ok = result.title === 'Getway Chat' && result.bridge === 'object'
       && result.ua_marker && result.guard === 'expired';
-    result.step = 'done';
+    if (result.ok || !result.gave_up_after_ms) result.step = 'done';
     clearTimeout(timer);
     finish(result.ok ? 0 : 1);
   })().catch((e) => { result.error = String(e && e.message); clearTimeout(timer); finish(1); });
 }
 
+/** A probe answer that means the gateway is down right now (not an answer about the app). */
+function gatewayDown(answer) {
+  return /^5\d\d\b/.test(answer) || answer.startsWith('error ') || answer.startsWith('no answer');
+}
+
 /**
  * One signed-out GET of the gateway through the app's own session (its proxy, DNS and user
- * agent; no cookies), redirects not followed. Fills in the returned object as it answers.
+ * agent; no cookies), redirects not followed. Resolves with {answer, ms}; a 5xx also brings the
+ * headers that name who answered (`server`, `x-sso-status`, `content-type`) and the first 200
+ * characters of its body, so a red run says whether the ingress or the gateway sent it.
  */
 function probeGateway() {
-  const out = { answer: 'none yet' };
-  const t0 = Date.now();
-  let req;
-  const done = (answer) => {
-    if (out.answer !== 'none yet') return;
-    Object.assign(out, { answer, ms: Date.now() - t0 });
-    clearTimeout(timer);
-    try { req.abort(); } catch { /* already finished */ }
-  };
-  const timer = setTimeout(() => done('no answer in 20 s'), 20_000);
-  try {
-    req = net.request({ url: GATEWAY, session: session.defaultSession, useSessionCookies: false, redirect: 'manual' });
-    req.setHeader('Accept', 'text/html');
-    req.on('redirect', (status, _method, location) => done(`${status} ${shortUrl(location)}`));
-    req.on('response', (res) => done(`${res.statusCode}`));
-    req.on('error', (err) => done(`error ${err?.message}`));
-    req.end();
-  } catch (err) {
-    done(`error ${err?.message}`);
-  }
-  return out;
+  return new Promise((resolve) => {
+    const out = { answer: 'none yet' };
+    const t0 = Date.now();
+    let req;
+    const done = (answer) => {
+      if (out.answer !== 'none yet') return;
+      Object.assign(out, { answer, ms: Date.now() - t0 });
+      clearTimeout(timer);
+      try { req.abort(); } catch { /* already finished */ }
+      resolve(out);
+    };
+    const timer = setTimeout(() => done('no answer in 20 s'), 20_000);
+    try {
+      req = net.request({ url: GATEWAY, session: session.defaultSession, useSessionCookies: false, redirect: 'manual' });
+      req.setHeader('Accept', 'text/html');
+      req.on('redirect', (status, _method, location) => done(`${status} ${shortUrl(location)}`));
+      req.on('response', (res) => {
+        if (res.statusCode < 500) return done(`${res.statusCode}`);
+        const h = res.headers || {};
+        out.headers = Object.fromEntries(['server', 'x-sso-status', 'content-type']
+          .filter((k) => h[k] !== undefined).map((k) => [k, String(h[k])]));
+        let body = '';
+        const end = () => { out.body = body.replace(/\s+/g, ' ').trim().slice(0, 200); done(`${res.statusCode}`); };
+        res.on('data', (chunk) => { body += chunk; if (body.length >= 200) end(); });
+        res.on('end', end);
+        res.on('error', end);
+      });
+      req.on('error', (err) => done(`error ${err?.message}`));
+      req.end();
+    } catch (err) {
+      done(`error ${err?.message}`);
+    }
+  });
 }
