@@ -47,6 +47,7 @@ export const app = {
   getPath: (name) => { if (name !== 'userData') throw new Error(name); return fake.userData; },
   setPath: (name, p) => { if (name === 'userData') fake.userData = p; },
   setBadgeCount: (n) => { fake.badge.push(n); return true; },
+  getBadgeCount: () => fake.badge.at(-1) ?? 0,
   quit: () => { fake.appEvents.emit('before-quit'); fake.exited = 0; },
   exit: (code) => { fake.exited = code; },
 };
