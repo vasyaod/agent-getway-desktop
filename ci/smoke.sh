@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launches the packaged app on this runner in its smoke mode (src/main.js smoke()) and checks
 # what it reports: the window and start page with its bridge, the tray and its icons (templates
-# on macOS), the UA marker, and the sign-in guard turning a signed-out visit to
+# on macOS), the Dock badge (macOS), the UA marker, and the sign-in guard turning a signed-out visit to
 # agent-getway.f-proj.com back to the start page.
 # The app runs on a throwaway profile and exits by itself: in seconds, or, while the gateway
 # answers 5xx or cannot be reached (agent-getway's Recreate rollout), after retrying it for up

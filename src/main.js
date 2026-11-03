@@ -528,6 +528,8 @@ function smoke(file) {
       return { empty: img.isEmpty(), size: img.getSize(), scales: img.getScaleFactors(), template: img.isTemplateImage() };
     });
     result.ua_marker = session.defaultSession.getUserAgent().includes(UA_MARKER);
+    // macOS: the Dock badge over the app icon, so CI's Dock screenshot (ci/dock-shot.sh) shows it.
+    if (process.platform === 'darwin') { app.setBadgeCount(2); result.dock_badge = app.getBadgeCount(); }
     result.step = 'gateway guard';
     result.attempts = [];
     const t0 = Date.now();
@@ -552,7 +554,7 @@ function smoke(file) {
     result.guard = lastGuard;
     result.trace = trace;
     result.ok = result.title === 'Getway Chat' && result.bridge === 'object'
-      && result.ua_marker && result.guard === 'expired'
+      && result.ua_marker && result.guard === 'expired' && (process.platform !== 'darwin' || result.dock_badge === 2)
       && result.tray_icons.every((i) => !i.empty && i.size.width === 16 && i.template === (process.platform === 'darwin'));
     if (result.ok || !result.gave_up_after_ms) result.step = 'done';
     clearTimeout(timer);

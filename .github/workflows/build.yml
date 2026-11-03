@@ -97,6 +97,18 @@ jobs:
           path: out/*
           if-no-files-found: error
           retention-days: 7
+      - name: Dock screenshots, the latest release beside this build (macOS)
+        if: matrix.platform == 'mac'
+        continue-on-error: true
+        run: ci/dock-shot.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: matrix.platform == 'mac'
+        continue-on-error: true
+        with:
+          name: dock-mac
+          path: ${{ runner.temp }}/dock/*.png
+          if-no-files-found: warn
+          retention-days: 7
 
   publish:
     name: sign, attest, publish

@@ -33,7 +33,7 @@
     "publish": null,
     "mac": {
       "category": "public.app-category.productivity",
-      "icon": "build/icon.png",
+      "icon": "build/icon.icns",
       "artifactName": "GetwayChat-mac-${arch}.${ext}",
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Getway Chat records voice messages for your agent."
@@ -41,7 +41,7 @@
       "target": ["dmg", "zip"]
     },
     "win": {
-      "icon": "build/icon.png",
+      "icon": "build/icon.ico",
       "artifactName": "GetwayChat-win-${arch}.${ext}",
       "target": ["nsis"]
     },

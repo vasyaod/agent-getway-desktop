@@ -149,8 +149,8 @@ navigation and permission rules, notifications, the badge, sign-out and window s
 
 `GETWAY_CHAT_SMOKE=<file>` starts the app in its launch check (`smoke()` in `src/main.js`,
 run by `ci/smoke.sh`). It uses a throwaway profile. It checks the window, the start page and
-its bridge, the tray, that the packaged tray icons load (templates on macOS), the UA marker, and
-that a signed-out visit to the gateway is turned back to the start page. It writes the result to `<file>` and exits. agent-getway runs one pod
+its bridge, the tray, that the packaged tray icons load (templates on macOS), the Dock badge
+(macOS), the UA marker, and that a signed-out visit to the gateway is turned back to the start page. It writes the result to `<file>` and exits. agent-getway runs one pod
 with a Recreate rollout, so every deploy is minutes of 503: while the gateway answers 5xx or
 cannot be reached (in the probe or in the window's own load), the smoke tries it again with a
 back-off for up to 12 minutes, and lists each failed try in `attempts` (the probe's answer, the
@@ -171,7 +171,18 @@ registry, the same one as the Android app: a white speech bubble on **#29B6D1**.
 byte (`test/brand.test.mjs` checks the sha256). `npm run icons` (`scripts/make-icons.py`, needs
 Pillow) makes the app, window, tray and badge icons from that PNG. Commit the result.
 
-The app and window icons keep the brand colour. The tray icon is the bubble alone, monochrome
+The app icon is drawn by that script, not scaled: the registry's bubble, crisp at every size, on
+a tile with a top-to-bottom gradient of the brand colour, with a soft shadow under the bubble.
+On macOS it follows Apple's icon grid, so it sits in the Dock, Finder and the Cmd+Tab switcher at
+the size of its neighbours: a squircle 824 px wide on a 1024 px canvas (straight sides,
+continuous corners), transparent padding round it and a drop shadow below it,
+`build/icon.icns` with every size from 16 to 512 pt at @1x and @2x (`build/icon-mac.png` is
+the 1024 px one, to look at). Windows (`build/icon.ico`, 16 to 256 px) and Linux
+(`build/icon.png`) get the same tile almost full-bleed and without the shadow, as icons there
+are. On every push the macOS build job uploads `dock-mac`: Dock screenshots of the latest
+release beside the new build, which shows its unread badge (`ci/dock-shot.sh`).
+
+The tray icon is the bubble alone, monochrome
 like the other icons there, and drawn on whole pixels at 16, 24 and 32 px rather than scaled
 down from the PNG: white on Windows and Linux (`tray*.png`), and on macOS a template image
 (`tray*Template*.png`, black plus alpha) that the menu bar tints for light and dark mode. While
