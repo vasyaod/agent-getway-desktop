@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Launches the packaged app on this runner in its smoke mode (src/main.js smoke()) and checks
 # what it reports: the window and start page with its bridge, the tray and its icons (templates
-# on macOS), the Dock badge (macOS), the UA marker, and the sign-in guard turning a signed-out visit to
+# on macOS), the Dock badge (macOS), the UA marker, the chat's inline media kinds (ci/media's PNG,
+# MP4 and WebM shown and played in the window), and the sign-in guard turning a signed-out visit to
 # agent-getway.f-proj.com back to the start page.
 # The app runs on a throwaway profile and exits by itself: in seconds, or, while the gateway
 # answers 5xx or cannot be reached (agent-getway's Recreate rollout), after retrying it for up
@@ -13,6 +14,9 @@ platform="$1"
 report="${RUNNER_TEMP:-/tmp}/getway-chat-smoke.json"
 rm -f "$report"
 export GETWAY_CHAT_SMOKE="$report"
+# The app reads it with Node: on Windows a D:/a/… path, not Git Bash's /d/a/….
+if [ "$platform" = win ]; then media="$(pwd -W)/ci/media"; else media="$PWD/ci/media"; fi
+export GETWAY_CHAT_SMOKE_MEDIA="$media"
 
 case "$platform" in
   linux)
