@@ -58,6 +58,13 @@ gh attestation verify GetwayChat-linux-x64.AppImage -R vasyaod/agent-getway-desk
 - **Links to other sites** (the swarm session link, GitHub, anything not
   agent-getway.f-proj.com) open in your browser. So does anything the chat opens in a new tab.
   Nothing else can be navigated to inside the window (`src/navigation.js`).
+- **Files the agent sends** (agent-getway#223): images and MP4/WebM videos show in the chat.
+  Anything else, PDFs included, is a download card. Clicking it opens a Save dialog in your
+  Downloads folder. The app fetches the file with its own sign-in and never hands a gateway file
+  URL (`/api/web/chats/<chat>/files/<file>`) to your browser, which is not signed in. When the
+  file is saved, a notification says so; click it to show the file in its folder. Downloads
+  from anywhere but agent-getway.f-proj.com are cancelled (`src/navigation.js` `'download'`,
+  `src/main.js` `saveDownloads`).
 - **The window** remembers its size, position and maximized state (`window.json` in the app's
   data folder). If the monitor it was on is gone, it opens centred instead (`src/windowstate.js`).
   Closing the window hides it. The app keeps running in the tray, or in the dock on macOS.
@@ -150,7 +157,10 @@ navigation and permission rules, notifications, the badge, sign-out and window s
 `GETWAY_CHAT_SMOKE=<file>` starts the app in its launch check (`smoke()` in `src/main.js`,
 run by `ci/smoke.sh`). It uses a throwaway profile. It checks the window, the start page and
 its bridge, the tray, that the packaged tray icons load (templates on macOS), the Dock badge
-(macOS), the UA marker, and that a signed-out visit to the gateway is turned back to the start page. It writes the result to `<file>` and exits. agent-getway runs one pod
+(macOS), the UA marker, the chat's inline media (with `GETWAY_CHAT_SMOKE_MEDIA=ci/media`, which
+`ci/smoke.sh` sets: a PNG must decode and an MP4 and a WebM must play in the window, served from
+a loopback server with the gateway's headers; the report's `media` says which failed and its
+media error), and that a signed-out visit to the gateway is turned back to the start page. It writes the result to `<file>` and exits. agent-getway runs one pod
 with a Recreate rollout, so every deploy is minutes of 503: while the gateway answers 5xx or
 cannot be reached (in the probe or in the window's own load), the smoke tries it again with a
 back-off for up to 12 minutes, and lists each failed try in `attempts` (the probe's answer, the

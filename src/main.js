@@ -11,11 +11,13 @@
 // gateway's SSO reads that cookie like any browser session; the reply watcher reads it back here
 // and sends it as `Authorization: Bearer`. No page can read it and it is never logged.
 import { app, BrowserWindow, Menu, Notification, Tray, ipcMain, nativeImage, net, screen, session, shell, systemPreferences } from 'electron';
+import { readFile } from 'node:fs/promises';
+import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHAT_URL, COOKIE, COOKIE_DOMAIN, GATEWAY, POLL_MS, UA_MARKER } from './config.js';
-import { classify, openChatId } from './navigation.js';
+import { classify, isGatewayDownload, openChatId } from './navigation.js';
 import { liveRecord, redeem, revoke, startSignIn } from './oauth.js';
 import { getJson, poll } from './poller.js';
 import { readJson, writeJson } from './store.js';
@@ -35,6 +37,9 @@ const SMOKE_MS = Number(process.env.GETWAY_CHAT_SMOKE_MS) || 60_000; // tests sh
 // seen). The retries wait BACKOFF, 2x, 4x… capped at 6x between attempts. Tests shorten both.
 const SMOKE_RETRY_MS = Number(process.env.GETWAY_CHAT_SMOKE_RETRY_MS) || 12 * 60_000;
 const SMOKE_BACKOFF_MS = Number(process.env.GETWAY_CHAT_SMOKE_BACKOFF_MS) || 5_000;
+// GETWAY_CHAT_SMOKE_MEDIA=<dir> (ci/media): the smoke also shows an image and plays an MP4 and a
+// WebM in the window, the kinds the chat shows inline (smokeMedia()).
+const SMOKE_MEDIA = process.env.GETWAY_CHAT_SMOKE_MEDIA || '';
 if (SMOKE) app.setPath('userData', path.join(tmpdir(), `getway-chat-smoke-${process.pid}`));
 
 // Smoke only: what the window and the guard did since the gateway load started, so a red run
@@ -66,6 +71,7 @@ let polling = false;
 let lastGuard = null; // the last auth.f-proj.com navigation the guard turned back (smoke)
 let status = { phase: 'idle', message: null, error: false };
 const notes = new Map(); // chat id -> its Notification: one per chat, kept from GC
+const savedNotes = new Set(); // "Downloaded" notifications, kept from GC until clicked or closed
 let replies = { primed: false, chats: {} };
 
 const unread = new Unread(showBadge);
@@ -87,6 +93,7 @@ async function start() {
   const ses = session.defaultSession;
   ses.setUserAgent(`${ses.getUserAgent()} ${UA_MARKER}`);
   guardPermissions(ses);
+  saveDownloads(ses);
   ipc();
   createWindow();
   createTray();
@@ -149,9 +156,10 @@ function createWindow() {
   const wc = win.webContents;
   wc.setWindowOpenHandler(({ url }) => {
     // New windows never open in the app: other sites, and the gateway's own target=_blank links,
-    // go to the system browser.
+    // go to the system browser. A file the agent sent is downloaded here, signed in.
     const kind = classify(url);
-    if (kind === 'external' || kind === 'gateway') shell.openExternal(url);
+    if (kind === 'download') wc.downloadURL(url);
+    else if (kind === 'external' || kind === 'gateway') shell.openExternal(url);
     return { action: 'deny' };
   });
   wc.on('will-navigate', (e) => { mark('will-navigate', e.url); guard(e, e.url); });
@@ -179,6 +187,7 @@ function guard(e, url) {
   if (kind === 'gateway') return;
   e.preventDefault();
   if (kind === 'external') shell.openExternal(url);
+  else if (kind === 'download') win.webContents.downloadURL(url); // the chat stays on screen
   else if (kind === 'signed_out' || kind === 'expired') {
     lastGuard = kind;
     mark(`guard ${kind}`);
@@ -449,6 +458,45 @@ function guardPermissions(ses) {
   });
 }
 
+// ---- downloads ---------------------------------------------------------------------------------
+
+/**
+ * Files the agent sent (agent-getway#223): the chat's download card (`<a href download>`, same
+ * origin), or a gateway file URL the guard or the new-window handler turned into a download. This
+ * session fetches it, so with the app's own sign-in. A Save dialog, opening in Downloads, asks
+ * where it goes; when it is saved a notification says so, and clicking it shows the file in its
+ * folder. A download from anywhere but the gateway is cancelled.
+ */
+function saveDownloads(ses) {
+  ses.on('will-download', (_e, item) => {
+    if (!isGatewayDownload(item.getURL())) { item.cancel(); return; }
+    const name = item.getFilename();
+    item.setSaveDialogOptions({ title: `Save ${name}`, defaultPath: path.join(app.getPath('downloads'), name) });
+    item.once('done', (_ev, state) => {
+      if (state === 'cancelled') return; // the user closed the Save dialog
+      const file = item.getSavePath();
+      if (state === 'completed') {
+        app.dock?.downloadFinished?.(file); // macOS: bounces the Downloads stack
+        savedNote('Downloaded', `${path.basename(file)} is saved. Click to show it in its folder.`, file);
+      } else {
+        savedNote('Download failed', `${name} could not be saved.`, null);
+      }
+    });
+  });
+}
+
+function savedNote(title, body, file) {
+  if (!Notification.isSupported()) return;
+  const note = new Notification({ title, body, silent: true, icon: asset('icon.png') });
+  note.on('click', () => {
+    savedNotes.delete(note);
+    if (file) shell.showItemInFolder(file);
+  });
+  note.on('close', () => savedNotes.delete(note));
+  savedNotes.add(note);
+  note.show();
+}
+
 // ---- smoke (CI) -------------------------------------------------------------------------------
 
 /**
@@ -530,6 +578,10 @@ function smoke(file) {
     result.ua_marker = session.defaultSession.getUserAgent().includes(UA_MARKER);
     // macOS: the Dock badge over the app icon, so CI's Dock screenshot (ci/dock-shot.sh) shows it.
     if (process.platform === 'darwin') { app.setBadgeCount(2); result.dock_badge = app.getBadgeCount(); }
+    if (SMOKE_MEDIA) {
+      result.step = 'media';
+      result.media = await smokeMedia(SMOKE_MEDIA);
+    }
     result.step = 'gateway guard';
     result.attempts = [];
     const t0 = Date.now();
@@ -554,13 +606,71 @@ function smoke(file) {
     result.guard = lastGuard;
     result.trace = trace;
     result.ok = result.title === 'Getway Chat' && result.bridge === 'object'
-      && result.ua_marker && result.guard === 'expired' && (process.platform !== 'darwin' || result.dock_badge === 2)
+      && result.ua_marker && result.guard === 'expired' && (!SMOKE_MEDIA || result.media?.ok === true) && (process.platform !== 'darwin' || result.dock_badge === 2)
       && result.tray_icons.every((i) => !i.empty && i.size.width === 16 && i.template === (process.platform === 'darwin'));
     if (result.ok || !result.gave_up_after_ms) result.step = 'done';
     clearTimeout(timer);
     finish(result.ok ? 0 : 1);
   })().catch((e) => { result.error = String(e && e.message); clearTimeout(timer); finish(1); });
 }
+
+/**
+ * The chat shows an agent's images and MP4/WebM videos inline (agent-getway#223). This window
+ * loads a page from a loopback server with ci/media's PNG, MP4 and WebM, served as the gateway
+ * serves them (their type, nosniff, a sandboxing CSP), and reports whether the image decoded and
+ * each video played: its first frames, its size, or the media error.
+ */
+async function smokeMedia(dir) {
+  const types = { 'sample.png': 'image/png', 'sample.mp4': 'video/mp4', 'sample.webm': 'video/webm' };
+  const page = '<!doctype html><title>media</title><img src="sample.png" alt="">'
+    + '<video id="mp4" src="sample.mp4" muted playsinline preload="metadata"></video>'
+    + '<video id="webm" src="sample.webm" muted playsinline preload="metadata"></video>';
+  const server = http.createServer(async (req, res) => {
+    const name = new URL(req.url, 'http://127.0.0.1').pathname.slice(1);
+    if (name === '') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(page); return; }
+    if (!types[name]) { res.writeHead(404); res.end(); return; }
+    const body = await readFile(path.join(dir, name)).catch(() => null);
+    if (!body) { res.writeHead(404); res.end(); return; }
+    res.writeHead(200, { 'content-type': types[name], 'content-length': body.length,
+      'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; sandbox" });
+    res.end(body);
+  });
+  await new Promise((resolve) => { server.listen(0, '127.0.0.1', resolve); });
+  try {
+    await win.loadURL(`http://127.0.0.1:${server.address().port}/`);
+    return await win.webContents.executeJavaScript(MEDIA_CHECK);
+  } catch (e) {
+    return { ok: false, error: String(e && e.message) };
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+}
+
+// Runs in the media page: the image decodes, each video reaches a frame past 0 s on its own.
+const MEDIA_CHECK = `(async () => {
+  const img = document.querySelector('img');
+  const image = await img.decode().then(
+    () => ({ ok: img.naturalWidth > 0, width: img.naturalWidth, height: img.naturalHeight }),
+    (e) => ({ ok: false, error: String(e) }));
+  const play = (v) => new Promise((resolve) => {
+    let t = null;
+    const done = (r) => {
+      if (!t) return;
+      clearTimeout(t); t = null;
+      resolve({ ...r, readyState: v.readyState, currentTime: v.currentTime });
+    };
+    t = setTimeout(() => done({ ok: false, error: 'not playing after 15 s' }), 15000);
+    v.addEventListener('timeupdate', () => {
+      if (v.currentTime > 0 && v.videoWidth > 0) done({ ok: true, width: v.videoWidth, height: v.videoHeight });
+    });
+    v.addEventListener('error', () => done({ ok: false, error: 'media error ' + (v.error && v.error.code) + ' ' + (v.error && v.error.message) }));
+    v.play().catch((e) => done({ ok: false, error: String(e) }));
+  });
+  const mp4 = await play(document.getElementById('mp4'));
+  const webm = await play(document.getElementById('webm'));
+  return { ok: image.ok && mp4.ok && webm.ok, image, mp4, webm };
+})()`;
 
 /** A probe answer that means the gateway is down right now (not an answer about the app). */
 function gatewayDown(answer) {

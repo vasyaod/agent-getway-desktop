@@ -15,6 +15,9 @@ export function reset({ userData, cookies = [], focused = true } = {}) {
     trays: [],
     notifications: [],
     opened: [], // shell.openExternal
+    shownInFolder: [], // shell.showItemInFolder
+    downloads: [], // webContents.downloadURL
+    sessionEvents: new EventEmitter(), // session.defaultSession.on: 'will-download'
     handlers: {}, // ipcMain.handle
     appEvents: new EventEmitter(),
     badge: [],
@@ -34,6 +37,7 @@ export function reset({ userData, cookies = [], focused = true } = {}) {
     // or a function returning one, called once per request.
     netAnswer: { redirect: [302, 'https://auth.f-proj.com/login?rd=x'] },
     pageJs: { 'document.title': 'Getway Chat', 'typeof window.getway': 'object' }, // executeJavaScript
+    pageScript: null, // (code, url) => any other executeJavaScript's answer; null without it
   });
 }
 reset();
@@ -44,7 +48,11 @@ export const app = {
   on: (ev, fn) => fake.appEvents.on(ev, fn),
   whenReady: () => Promise.resolve(),
   getVersion: () => '0.1.0',
-  getPath: (name) => { if (name !== 'userData') throw new Error(name); return fake.userData; },
+  getPath: (name) => {
+    if (name === 'downloads') return '/home/me/Downloads';
+    if (name !== 'userData') throw new Error(name);
+    return fake.userData;
+  },
   setPath: (name, p) => { if (name === 'userData') fake.userData = p; },
   setBadgeCount: (n) => { fake.badge.push(n); return true; },
   getBadgeCount: () => fake.badge.at(-1) ?? 0,
@@ -55,10 +63,14 @@ export const app = {
 class WebContents extends EventEmitter {
   constructor() { super(); this.url = ''; this.sent = []; this.loads = []; }
   setWindowOpenHandler(fn) { this.openHandler = fn; }
+  downloadURL(url) { fake.downloads.push(url); }
   send(channel, data) { this.sent.push([channel, data]); }
   getURL() { return this.url; }
   isLoading() { return !!this.pending; }
-  async executeJavaScript(code) { return fake.pageJs[code] ?? null; }
+  async executeJavaScript(code) {
+    if (code in fake.pageJs) return fake.pageJs[code];
+    return fake.pageScript ? fake.pageScript(code, this.url) : null;
+  }
   /** A page-initiated navigation: returns true if main.js let it through. */
   navigate(url, ev = 'will-navigate') {
     let prevented = false;
@@ -136,6 +148,20 @@ class WebContents extends EventEmitter {
   }
 }
 
+/** A DownloadItem as will-download hands it over; finish(state) ends it as Chromium would. */
+export class DownloadItem extends EventEmitter {
+  constructor(url, filename, savePath = `/home/me/Downloads/${filename}`) {
+    super();
+    Object.assign(this, { url, filename, savePath, cancelled: false, dialog: null });
+  }
+  getURL() { return this.url; }
+  getFilename() { return this.filename; }
+  getSavePath() { return this.savePath; }
+  setSaveDialogOptions(o) { this.dialog = o; }
+  cancel() { this.cancelled = true; this.emit('done', {}, 'cancelled'); }
+  finish(state) { this.emit('done', {}, state); }
+}
+
 export class BrowserWindow extends EventEmitter {
   constructor(opts) {
     super();
@@ -204,6 +230,7 @@ const cookieMatches = (c, url, name) => c.name === name && new URL(url).hostname
 
 export const session = {
   defaultSession: {
+    on: (ev, fn) => fake.sessionEvents.on(ev, fn),
     getUserAgent: () => fake.userAgent,
     setUserAgent: (ua) => { fake.userAgent = ua; },
     setPermissionCheckHandler: (fn) => { fake.permissionCheck = fn; },
@@ -219,6 +246,7 @@ export const session = {
 
 export const shell = {
   openExternal: async (url) => { fake.opened.push(url); if (fake.onOpenExternal) fake.onOpenExternal(url); },
+  showItemInFolder: (p) => { fake.shownInFolder.push(p); },
 };
 
 export const systemPreferences = { askForMediaAccess: async () => true };

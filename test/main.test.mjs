@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { fake, nativeImage, reset } from './fake-electron/index.mjs';
+import { DownloadItem, fake, nativeImage, reset } from './fake-electron/index.mjs';
 
 const START = pathToFileURL(path.resolve('src/start/index.html')).href;
 const CHAT = 'https://agent-getway.f-proj.com/#/chat';
@@ -233,6 +233,64 @@ test('links: other sites open in the system browser; nothing else can be navigat
   quit();
 });
 
+test('a file the agent sent downloads in the app, with its session; the chat stays; other links unchanged', async () => {
+  net();
+  const win = await launch({ cookies: [liveCookie()] });
+  const wc = win.webContents;
+  const FILE = `https://agent-getway.f-proj.com/api/web/chats/${A}/files/f1`;
+  const before = wc.url;
+  // target=_blank or a middle click on the card: a download, not the system browser.
+  assert.deepEqual(wc.openHandler({ url: FILE }), { action: 'deny' });
+  // A plain link to the file: a download, and the window keeps the chat.
+  assert.equal(wc.navigate(FILE), false);
+  assert.equal(wc.url, before);
+  assert.deepEqual(fake.downloads, [FILE, FILE]);
+  assert.deepEqual(fake.opened, []);
+  // The gateway's other new-window links and other sites still go to the system browser.
+  wc.openHandler({ url: 'https://agent-getway.f-proj.com/#/chat' });
+  wc.openHandler({ url: 'https://github.com/x' });
+  assert.deepEqual(fake.opened, ['https://agent-getway.f-proj.com/#/chat', 'https://github.com/x']);
+  assert.deepEqual(fake.downloads, [FILE, FILE]);
+  quit();
+});
+
+test('downloads: a Save dialog in Downloads; "Downloaded" shows it in its folder; only the gateway\'s', async () => {
+  net();
+  await launch({ cookies: [liveCookie()] });
+  const start = (url, name, savePath) => {
+    const item = new DownloadItem(url, name, savePath);
+    fake.sessionEvents.emit('will-download', {}, item, fake.windows[0].webContents);
+    return item;
+  };
+  const pdf = start(`https://agent-getway.f-proj.com/api/web/chats/${A}/files/f1`, 'report.pdf', '/home/me/Desktop/q3.pdf');
+  assert.equal(pdf.cancelled, false);
+  assert.deepEqual(pdf.dialog, { title: 'Save report.pdf', defaultPath: path.join('/home/me/Downloads', 'report.pdf') });
+  assert.equal(fake.notifications.length, 0, 'nothing until it is saved');
+  pdf.finish('completed');
+  const [done] = fake.notifications;
+  assert.equal(done.opts.title, 'Downloaded');
+  assert.equal(done.opts.body, 'q3.pdf is saved. Click to show it in its folder.', 'the name the user saved it under');
+  assert.equal(done.shown, true);
+  done.emit('click');
+  assert.deepEqual(fake.shownInFolder, ['/home/me/Desktop/q3.pdf']);
+
+  start('blob:https://agent-getway.f-proj.com/1', 'notes.txt').finish('cancelled'); // the dialog closed
+  assert.equal(fake.notifications.length, 1, 'a closed Save dialog says nothing');
+  start(`https://agent-getway.f-proj.com/api/web/chats/${A}/files/f2`, 'big.zip').finish('interrupted');
+  assert.equal(fake.notifications[1].opts.title, 'Download failed');
+  assert.equal(fake.notifications[1].opts.body, 'big.zip could not be saved.');
+  fake.notifications[1].emit('click');
+  assert.deepEqual(fake.shownInFolder, ['/home/me/Desktop/q3.pdf']);
+
+  for (const url of ['https://evil.example/x.exe', 'data:application/octet-stream,x', 'blob:https://evil.example/1']) {
+    const item = start(url, 'x.exe');
+    assert.equal(item.cancelled, true, url);
+    assert.equal(item.dialog, null, url);
+  }
+  assert.equal(fake.notifications.length, 2);
+  quit();
+});
+
 test('the gateway\'s Sign out revokes this app\'s token and shows Sign in', async () => {
   const n = net();
   const win = await launch({ cookies: [liveCookie('fpu_old')] });
@@ -275,9 +333,10 @@ test('a refused start-page load (Electron ERR_FAILED) is retried, so a session t
 });
 
 /** The app in CI's smoke mode (GETWAY_CHAT_SMOKE): runs until it exits, returns its report. */
-async function smokeRun({ ms, retryMs, setup = () => {} } = {}) {
+async function smokeRun({ ms, retryMs, media, setup = () => {} } = {}) {
   const report = path.join(mkdtempSync(path.join(tmpdir(), 'gc-smoke-')), 'report.json');
   process.env.GETWAY_CHAT_SMOKE = report;
+  if (media) process.env.GETWAY_CHAT_SMOKE_MEDIA = media;
   if (ms) process.env.GETWAY_CHAT_SMOKE_MS = String(ms);
   if (retryMs) process.env.GETWAY_CHAT_SMOKE_RETRY_MS = String(retryMs);
   process.env.GETWAY_CHAT_SMOKE_BACKOFF_MS = '1';
@@ -291,6 +350,7 @@ async function smokeRun({ ms, retryMs, setup = () => {} } = {}) {
     delete process.env.GETWAY_CHAT_SMOKE_MS;
     delete process.env.GETWAY_CHAT_SMOKE_RETRY_MS;
     delete process.env.GETWAY_CHAT_SMOKE_BACKOFF_MS;
+    delete process.env.GETWAY_CHAT_SMOKE_MEDIA;
   }
   return { code: fake.exited, report: JSON.parse(readFileSync(report, 'utf8')) };
 }
@@ -320,6 +380,55 @@ test('smoke: a signed-out gateway visit is redirected to /login, cancelled, and 
   ]);
   assert.equal(fake.windows[0].webContents.loads.includes('https://auth.f-proj.com/login?rd=https%3A%2F%2Fagent-getway.f-proj.com%2F'), false,
     'auth.f-proj.com never loads in the window');
+});
+
+const REDIRECT_TO_LOGIN = () => {
+  fake.redirects['https://agent-getway.f-proj.com/'] = 'https://auth.f-proj.com/login?rd=https%3A%2F%2Fagent-getway.f-proj.com%2F';
+};
+
+test('smoke: ci/media is served to the window as the gateway serves it, and the page\'s verdict is reported', async () => {
+  net();
+  const served = {};
+  const { code, report } = await smokeRun({ media: path.resolve('ci/media'), setup: () => {
+    REDIRECT_TO_LOGIN();
+    fake.pageScript = async (js, url) => {
+      assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/$/);
+      assert.match(js, /querySelector\('img'\)/);
+      const page = await realFetch(url);
+      served.page = await page.text();
+      for (const name of ['sample.png', 'sample.mp4', 'sample.webm', 'nope.txt', '..%2Fsmoke.sh']) {
+        const r = await realFetch(new URL(name, url));
+        served[name] = { status: r.status, type: r.headers.get('content-type'), nosniff: r.headers.get('x-content-type-options'),
+          csp: r.headers.get('content-security-policy'), bytes: (await r.arrayBuffer()).byteLength };
+      }
+      return { ok: true, image: { ok: true, width: 64, height: 64 }, mp4: { ok: true }, webm: { ok: true } };
+    };
+  } });
+  assert.equal(code, 0, JSON.stringify(report));
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.media.image, { ok: true, width: 64, height: 64 });
+  assert.match(served.page, /<img src="sample.png"/);
+  assert.match(served.page, /<video id="mp4" src="sample.mp4" muted/);
+  assert.match(served.page, /<video id="webm" src="sample.webm" muted/);
+  for (const [name, type] of [['sample.png', 'image/png'], ['sample.mp4', 'video/mp4'], ['sample.webm', 'video/webm']]) {
+    assert.deepEqual(served[name], { status: 200, type, nosniff: 'nosniff', csp: "default-src 'none'; sandbox",
+      bytes: readFileSync(path.resolve('ci/media', name)).length }, name);
+  }
+  assert.equal(served['nope.txt'].status, 404);
+  assert.equal(served['..%2Fsmoke.sh'].status, 404);
+  assert.equal(report.guard, 'expired', 'the gateway guard still runs after the media step');
+});
+
+test('smoke: a video that does not play fails the smoke and says why', async () => {
+  net();
+  const verdict = { ok: false, image: { ok: true }, mp4: { ok: false, error: 'media error 4 DEMUXER_ERROR_NO_SUPPORTED_STREAMS' }, webm: { ok: true } };
+  const { code, report } = await smokeRun({ media: path.resolve('ci/media'), setup: () => {
+    REDIRECT_TO_LOGIN();
+    fake.pageScript = async () => verdict;
+  } });
+  assert.equal(code, 1);
+  assert.equal(report.ok, false);
+  assert.deepEqual(report.media, verdict);
 });
 
 test('smoke: when time runs out the report names the step, the URL, lastGuard, the trace and the probe', async () => {

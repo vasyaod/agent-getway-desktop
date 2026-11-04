@@ -1,6 +1,10 @@
 // What the window does with a URL a page tries to open. Pure, so `npm test` covers it.
 //
 //   'gateway'     agent-getway.f-proj.com over https: loads in the window.
+//   'download'    a file the agent sent into a chat (agent-getway#223), on the gateway:
+//                 /api/web/chats/<chat>/files/<file>. Never loaded in the window and never handed
+//                 to the system browser, which has no sign-in for it: the app downloads it with
+//                 its own session (main.js saveDownloads).
 //   'signed_out'  auth.f-proj.com/logout…: the gateway's Sign out link. The app revokes its
 //                 token and shows its start page.
 //   'expired'     any other auth.f-proj.com page: the gateway sends a session that ended to
@@ -13,11 +17,15 @@
 // This mirrors the Android app's SignInGuardPlugin.java and its allowNavigation.
 import { AUTH_HOST, GATEWAY_HOST } from './config.js';
 
+const GATEWAY_FILE = /^\/api\/web\/chats\/[^/]+\/files\/[^/]+$/; // agent-getway agent_files.file_url
+
 export function classify(raw) {
   let u;
   try { u = new URL(raw); } catch { return 'block'; }
   const host = u.hostname.toLowerCase();
-  if (u.protocol === 'https:' && host === GATEWAY_HOST && !u.username && !u.password) return 'gateway';
+  if (u.protocol === 'https:' && host === GATEWAY_HOST && !u.username && !u.password) {
+    return GATEWAY_FILE.test(u.pathname) ? 'download' : 'gateway';
+  }
   if ((u.protocol === 'https:' || u.protocol === 'http:') && host === AUTH_HOST) {
     return u.pathname.startsWith('/logout') ? 'signed_out' : 'expired';
   }
@@ -39,3 +47,15 @@ export function openChatId(raw) {
 }
 
 export const isChatId = (id) => typeof id === 'string' && CHAT_ID.test(id);
+
+/**
+ * A download the app saves: one from the gateway (a file the agent sent, or any other gateway
+ * URL its page downloads), or a blob: the gateway page made. Anything else is cancelled.
+ */
+export function isGatewayDownload(raw) {
+  const kind = classify(raw);
+  if (kind === 'download' || kind === 'gateway') return true;
+  let u;
+  try { u = new URL(raw); } catch { return false; }
+  return u.protocol === 'blob:' && classify(u.origin) === 'gateway';
+}
